@@ -1,13 +1,13 @@
-FROM golang:1.11-alpine
+FROM alpine:3.5
 
 WORKDIR /go/src/gotee
-COPY . .
+COPY client.go tee.go ./
 
-RUN apk add --no-cache git mercurial \
-    && go get -d -v ./... \
-    && apk del git mercurial
-RUN go install -v ./...
+RUN apk add --no-cache go musl-dev git mercurial \
+    && GOPATH=/go go get -d -v ./... \
+    && GOPATH=/go CGO_ENABLED=0 go install -v ./... \
+    && apk del go musl-dev git mercurial
 
-ENTRYPOINT [ "gotee" ]
-CMD [ "--listen", "2003" ]
+ENTRYPOINT [ "/go/bin/gotee" ]
+CMD [ "--listen", "2003", "-1", "4001", "-2", "4002" ]
 
