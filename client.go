@@ -1,60 +1,81 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"log"
 	"net"
+	"time"
 )
 
 type client struct {
 	addr     string
 	protocal string
-	ch       chan []byte
+	data     chan []byte
+	done     chan bool
+	conn     net.Conn
+	bw       *bufio.Writer
 }
 
 // initialize new client and its channel
 func newClient(addr string, protocal string) *client {
 	c := client{addr: addr, protocal: protocal}
-	c.ch = make(chan []byte)
+	c.data = make(chan []byte)
+	c.done = make(chan bool)
 	return &c
 }
 
-func (c *client) write(b *bytes.Buffer) {
+func (c *client) newConnection() net.Conn {
 	conn, err := net.Dial(c.protocal, c.addr)
 	if err != nil {
-		log.Print("Failed to open connection to %s: %s", c.addr, err)
-		return
-	}
-	defer conn.Close()
-
-	n, err := conn.Write([]byte("data"))
-	// w := bufio.NewWriter(conn)
-	// n, err := b.WriteTo(w)
-	if err != nil {
 		log.Print(err)
-	} else {
-		log.Print(n)
+		return nil
 	}
+	if c.bw == nil {
+		c.bw = bufio.NewWriterSize(conn, 4*1024)
+	} else {
+		c.bw.Reset(conn)
+	}
+	return conn
 }
 
-func (c *client) run() {
-	batchSize := 20
-	buf := bytes.NewBuffer(nil)
+func (c *client) run(debug bool) {
+	var conn net.Conn
 
+	defer func() {
+		log.Println("Close connection")
+		if conn != nil {
+			c.bw.Flush()
+			conn.Close()
+		}
+	}()
+
+	// Try to re-open connection every 5 minutes
+	tick := time.NewTicker(time.Minute).C
+
+	conn = c.newConnection()
 	for {
-		data := <-c.ch
+		select {
+		case data := <-c.data:
+			if debug {
+				log.Printf("[Debug][%s] Received %d bytes data", c.addr, len(data))
+			}
 
-		if buf.Len()+len(data) <= batchSize {
-			// write data into buffer
-			buf.Write(data)
-			// log.Printf("Length of the buffer: %d", buf.Len())
-		} else {
-			// send data in buffer to outbound port
-			log.Print(buf)
-			c.write(buf)
-
-			// clear buf
-			buf.Reset()
+			// Send data to target client, ignore them if the connection is not ready
+			if conn != nil && c.bw != nil {
+				_, err := c.bw.Write(append(data, '\n'))
+				if err != nil {
+					log.Printf("[Warning][%s] %s", c.addr, err)
+				}
+				if debug {
+					log.Printf("[Debug][%s] Buffered: %d bytes", c.addr, c.bw.Buffered())
+				}
+			}
+		case <-tick:
+			// Reopen connection if it is closed
+			if conn == nil {
+				log.Printf("[%s] Try to reopen", c.addr)
+				conn = c.newConnection()
+			}
 		}
 	}
 }

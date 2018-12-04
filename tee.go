@@ -1,38 +1,52 @@
 package main
 
 import (
+	"bufio"
 	"log"
 	"net"
+	"strings"
 
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
 	listen = kingpin.Flag("listen", "Listen port.").Short('l').Required().String()
-	out1   = kingpin.Flag("outport1", "Output port a.").Short('1').Required().String()
-	out2   = kingpin.Flag("outport2", "Output port b.").Short('2').Required().String()
-	debug  = kingpin.Flag("debug", "Debug.").Default("false").Bool()
+	out1   = kingpin.Flag("outport1", "Output port 1.").Short('1').Required().String()
+	out2   = kingpin.Flag("outport2", "Output port 2.").Short('2').Required().String()
+	debug  = kingpin.Flag("debug", "Debug.").Short('d').Default("false").Bool()
 )
 
 func main() {
 	kingpin.Parse()
 
-	listener, err := net.Listen("tcp", "localhost:"+*listen)
+	if *debug {
+		log.Print("Debug mode enabled")
+	}
 
+	// Listen on incoming port
+	listener, err := net.Listen("tcp", "localhost:"+*listen)
 	if err != nil {
 		log.Fatalf("Failed to listen to %s: %s", *listen, err)
 	} else {
 		log.Printf("Listening on port %s, forwarding to port %s and %s", *listen, *out1, *out2)
-		defer listener.Close()
 	}
+	defer listener.Close()
 
-	var clients []*client
-
-	clients = append(clients, newClient("localhost:"+*out1, "tcp"))
-	clients = append(clients, newClient("localhost:"+*out2, "tcp"))
-
+	// Initialize clients to output port
+	if !(strings.Contains(*out1, ":")) {
+		log.Print(*out1)
+		*out1 = "localhost:" + *out1
+	}
+	if !(strings.Contains(*out2, ":")) {
+		log.Print(*out2)
+		*out2 = "localhost:" + *out2
+	}
+	clients := [2]*client{
+		newClient(*out1, "tcp"),
+		newClient(*out2, "tcp"),
+	}
 	for i := range clients {
-		go clients[i].run() // reference client by array
+		go clients[i].run(*debug) // reference client by array index
 	}
 
 	for {
@@ -42,27 +56,18 @@ func main() {
 			log.Fatalf("ERROR: failed to accept listener: %s", err)
 		}
 
-		buf := make([]byte, 2048)
-
 		// send data from inbound connection to outbound clients
-		go func(conn net.Conn) {
+		go func() {
 			defer conn.Close()
-			// buf = buf[:0]
-
-			n, err := conn.Read(buf)
-
-			if err != nil {
-				log.Fatalf("Receive data failed: %s", err)
-			} else {
-				log.Printf("Recieve %d bytes data", n)
+			lineScanner := bufio.NewScanner(conn)
+			for {
+				if ok := lineScanner.Scan(); !ok {
+					break
+				}
 				for _, c := range clients {
-					c.ch <- buf[:n]
+					c.data <- lineScanner.Bytes()
 				}
 			}
-
-			if *debug {
-				log.Print(buf[:n])
-			}
-		}(conn)
+		}()
 	}
 }
