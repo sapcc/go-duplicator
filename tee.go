@@ -32,7 +32,7 @@ func checkError(e error, msgs ...string) bool {
 	return false
 }
 
-func checkEof(e error, msgs ...string) bool {
+func checkEOF(e error, msgs ...string) bool {
 	if e == io.EOF {
 		return true
 	}
@@ -72,67 +72,193 @@ func main() {
 		r2, w2 := io.Pipe()
 		go handleConnection(conn, w1, w2)
 		go writeFromPipeToRemote(r1, "c1")
-		go writeFromPipeToRemote6(r2, *out2)
+		go writeFromPipeToRemote7(r2, *out2)
 	}
+}
+
+func customWrite2(p []byte, conn *net.Conn, addr string) (int, error) {
+	log.Print("start")
+	var c *net.Conn
+	var err error
+	if *conn == nil {
+		*c, err = net.Dial("tcp", addr)
+		if err != nil {
+			return 0, err
+		}
+		conn = c
+	}
+	n, err := (*c).Write(p)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func customWrite(w *bufio.Writer, p []byte) {
 	// n, err := w.Write(p)
 	// checkError(err)
+	log.Print("customWrite", w)
 	if w != nil {
 		time.Sleep(1500 * time.Millisecond)
 		log.Printf("read from %s [%2d] %s", "c2", len(p), string(p))
 	}
 }
 
-func writeFromPipeToRemote6(r *io.PipeReader, c string) {
-	rb := bufio.NewReader(r)
+func customWrite3(c net.Conn, p []byte) (int, error) {
+	time.Sleep(1500 * time.Millisecond)
+	log.Printf("read from %s [%2d] %s", "c2", len(p), string(p))
+	n, err := c.Write(p)
+	return n, err
+}
+
+func writeFromPipeToRemote7(r *io.PipeReader, addr string) {
 	buf := newMyBuffer()
-	close := make(chan bool)
+	close := make(chan struct{}, 1)
 
-	var conn *net.Conn
-	var wr *bufio.Writer
-
-	// open connection
-	go func() {
-		for {
-			log.Print(wr == nil, conn == nil)
-			if wr == nil {
-				log.Print("Open connection")
-				conn, err := net.Dial("tcp", c)
-				if err != nil {
-					log.Print(err)
-				}
-				wr = bufio.NewWriter(conn)
-			}
-			time.Sleep(10 * time.Second)
+	var conn net.Conn
+	defer func() {
+		if conn != nil {
+			conn.Close()
 		}
 	}()
 
+	dialTarget := func() {
+		var err error
+		conn, err = net.Dial("tcp", addr)
+		if err != nil {
+			log.Print(err)
+		} else {
+			log.Printf("Connection to %s established", addr)
+		}
+	}
+	dialTarget()
+
+	ticker := time.NewTicker(10 * time.Second).C
+
+	// read from pipe and save data to buffer
+	// in case of error, stop reading
 	go func() {
-
+		rb := bufio.NewReader(r)
 		for {
-			var b []byte
-			var err error
-			select {
-			case <-close:
-				// flush buffer
-				b, err = buf.Flush()
-				checkError(err)
-				break
-			default:
-				b, err = buf.Read()
-				checkError(err)
+			b, err := rb.ReadBytes('\n')
+			if err != nil {
+				if err == io.EOF {
+					if conn != nil {
+						buf.Write(b)
+					}
+					buf.Close()
+				}
+				close <- struct{}{}
+				return
 			}
+			if conn != nil {
+				buf.Write(b)
+			}
+		}
+	}()
 
-			customWrite(wr, b)
+	// write to target
+	go func() {
+		for {
+			// block until buffer is not empty
+			b, err := buf.Read()
+			if err != nil {
+				if err == io.EOF {
+					if len(b) > 0 {
+						customWrite3(conn, b)
+					}
+				}
+				log.Print("exiting from write")
+				return
+			}
+			customWrite3(conn, b)
 		}
 	}()
 
 	for {
+		select {
+		case <-ticker:
+			if conn == nil {
+				dialTarget()
+			}
+		case <-close:
+			log.Print("bye")
+			return
+		}
+	}
+
+	// flush data
+}
+
+func writeFromPipeToRemote6(r *io.PipeReader, target string) {
+	rb := bufio.NewReader(r)
+	buf := newMyBuffer()
+	op := make(chan bool)
+	cl := make(chan bool)
+	done := make(chan bool)
+
+	// ticker := time.NewTicker(time.Minute).C
+	ticker := time.NewTicker(10 * time.Second).C
+
+	var conn net.Conn
+	var wr *bufio.Writer
+
+	dialTarget := func(t string) (*bufio.Writer, net.Conn) {
+		c, err := net.Dial("tcp", t)
+		if err != nil {
+			log.Print(err)
+			return nil, nil
+		}
+		w := bufio.NewWriter(c)
+		log.Printf("Connection to %s established", t)
+		return w, c
+	}
+
+	// open connection
+	go func() {
+		for {
+			select {
+			case <-ticker:
+				if wr == nil {
+					wr, conn = dialTarget(target)
+					// log.Print("ticker", wr)
+				}
+			case <-op:
+				if wr == nil {
+					wr, conn = dialTarget(target)
+					// log.Print("open", wr)
+				}
+			case <-cl:
+				if conn != nil {
+					conn.Close()
+				}
+				done <- true
+			}
+		}
+	}()
+
+	// write to target
+	go func() {
+		for {
+			// block until buffer is not empty
+			b, err := buf.Read()
+			if checkEOF(err) {
+				break
+			}
+			customWrite(wr, b)
+			// customWrite(b, tgtConn, target)
+		}
+	}()
+
+	op <- true
+
+	for {
 		b, err := rb.ReadBytes('\n')
-		if checkEof(err, "Read from pipe") {
-			close <- true
+		if checkEOF(err, "Read from pipe") {
+			b2, _ := buf.Flush()
+			if len(b2)+len(b) > 0 {
+				customWrite(wr, append(b2, b...))
+			}
 			break
 		}
 		if conn != nil && wr != nil {
@@ -140,6 +266,11 @@ func writeFromPipeToRemote6(r *io.PipeReader, c string) {
 			checkError(err, "Write to myBuffer")
 		}
 	}
+
+	cl <- true
+	<-done
+
+	log.Print("bye")
 }
 
 func writeFromPipeToRemote5(r *io.PipeReader, c string) {
@@ -168,7 +299,7 @@ func writeFromPipeToRemote5(r *io.PipeReader, c string) {
 
 	for {
 		b, err := rb.ReadBytes('\n')
-		if checkEof(err, "Read from pipe") {
+		if checkEOF(err, "Read from pipe") {
 			close <- true
 			break
 		}
