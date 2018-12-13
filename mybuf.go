@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"io"
-	"log"
 	"sync"
 )
 
@@ -34,7 +33,7 @@ func (m *myBuf) Read() ([]byte, error) {
 	if m.ctx[m.rd].Len() == 0 {
 		select {
 		case <-m.closeBuffer:
-			log.Print("closeBuffer")
+			// log.Print("closeBuffer")
 			return nil, io.EOF
 
 		// switching context when reading buffer is empty
@@ -42,7 +41,7 @@ func (m *myBuf) Read() ([]byte, error) {
 		// switching context and writing buffer can block each other
 		case <-m.notEmpty:
 			m.mtx.Lock()
-			log.Print("notEmpty", m.ctx[m.wr].Len())
+			// log.Print("notEmpty ", m.ctx[m.wr].Len())
 			m.rd, m.wr = m.wr, m.rd
 			m.mtx.Unlock()
 		}
