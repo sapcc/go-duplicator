@@ -112,10 +112,22 @@ func handlePipe(r io.Reader, addr string) {
 	done := make(chan bool)
 	stopdump := make(chan struct{})
 	ticker := time.NewTicker(5 * time.Second)
+	reconnect := make(chan bool)
 
 	defer func() {
 		close(stopdump)
 		ticker.Stop()
+	}()
+
+	go func() {
+		for {
+			if err := dumpReader(r, stopdump); err != nil {
+				if err := copyWithBuffer(conn, r); err != nil {
+					reconnect <- true
+				}
+			}
+			break
+		}
 	}()
 
 	go func() {
@@ -141,7 +153,7 @@ L:
 		select {
 		case <-done:
 			break L
-		default:
+		case <-ticker.C:
 			if conn == nil {
 				c, err := dialTarget(addr)
 				if err == nil {
@@ -149,7 +161,6 @@ L:
 					stopdump <- struct{}{}
 				}
 			}
-			time.Sleep(5 * time.Second)
 		}
 	}
 
