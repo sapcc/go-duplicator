@@ -13,30 +13,18 @@ import (
 )
 
 var (
-	listen = kingpin.Flag("listen", "Listen port.").Short('l').Default("2003").String()
+	listen = kingpin.Flag("listen", "Listen port.").Short('l').Default("2004").String()
 	out1   = kingpin.Flag("outport1", "Output port 1.").Short('1').Default("4001").String()
 	out2   = kingpin.Flag("outport2", "Output port 2.").Short('2').Default("4002").String()
 	debug  = kingpin.Flag("debug", "Debug.").Short('d').Default("false").Bool()
 )
 
-func checkError(e error, msgs ...string) bool {
-	m := strings.Join(msgs, ", ")
-	if e != nil {
-		if m != "" {
-			log.Fatalf(m+": %v", e)
-		} else {
-			log.Fatal(e)
-		}
-	}
-	return false
-}
-
-func checkEOF(e error, msgs ...string) bool {
-	if e == io.EOF {
-		return true
-	}
-	return checkError(e, msgs...)
-}
+// func checkEOF(e error, msgs ...string) bool {
+// 	if e == io.EOF {
+// 		return true
+// 	}
+// 	return checkError(e, msgs...)
+// }
 
 func main() {
 	kingpin.Parse()
@@ -70,101 +58,104 @@ func main() {
 		// writeFromPipeToRemote() wirte data stream out to remote address
 		// both asynchronous io read/write operation, therefore are wrapped in goroutine
 		// they are interconnected with io.Pipe
-		r1, w1 := io.Pipe()
-		r2, w2 := io.Pipe()
-		go handleConnection(conn, w1, w2)
-		go writeFromPipeToRemote1(r1, *out1)
-		go handlePipe(r2, *out2)
+		pwc1 := make(chan *io.PipeWriter)
+		pwc2 := make(chan *io.PipeWriter)
+		go handleConnection(conn, pwc1, pwc2)
+		go handlePipe1(*out1, pwc1)
+		go handlePipe2(*out2, pwc2)
 	}
 }
 
-func dumpReader(r io.Reader, stop <-chan struct{}) error {
-	log := func(c interface{}) { log.Printf("dumpReader: %s", c) }
+func handleConnection(conn net.Conn, pwc1, pwc2 <-chan *io.PipeWriter) {
+	var w1, w2 interface{}
+	defer conn.Close()
 
-	b := make([]byte, 4*1024)
+	r := bufio.NewReader(conn)
 	for {
+		// read from inbound connection.
+		// break loop, when read returns error (including EOF).
+		b, err := r.ReadBytes('\n')
+		if err != nil {
+			break
+		}
+
 		select {
-		case <-stop:
-			log("stop")
-			return errors.New("dump forcefully stopped")
+		case w1 = <-pwc1:
 		default:
-			if _, err := r.Read(b); err != nil {
-				log(err)
-				return nil
+		}
+
+		if pw1, ok := w1.(*io.PipeWriter); ok {
+			defer pw1.Close()
+			if _, err := pw1.Write(b); err != nil {
+				w1 = nil
 			}
+		}
+
+		select {
+		case w2 = <-pwc2:
+		default:
+		}
+
+		if pw2, ok := w2.(*io.PipeWriter); ok {
+			log.Print("get pw2")
+			defer pw2.Close()
+			if _, err := pw2.Write(b); err != nil {
+				w2 = nil
+			}
+		} else {
+			log.Print("skip2")
 		}
 	}
 }
 
-func dialTarget2(addr string, stopme <-chan struct{}) net.Conn {
+func handlePipe1(addr string, pwc chan *io.PipeWriter) {
+	log.Print("handlePipe1")
+	buf := make([]byte, 32*1024)
+	pr, pw := io.Pipe()
+	pwc <- pw
+
+	for {
+		if n, err := pr.Read(buf); err == nil {
+			log.Printf("hadlePipe1: read from %s [%2d] %s", addr, n, string(buf[:n]))
+		} else {
+			log.Print("hadlePipe1 done")
+			return
+		}
+	}
+}
+
+func handlePipe2(addr string, pwc chan *io.PipeWriter) {
+	log.Print("handlePipe2")
+
 	for {
 		conn, err := dialTarget(addr)
 		if err != nil {
 			time.Sleep(5 * time.Second)
 			continue
-			// stopdump <- struct{}{}
 		}
-		return conn
+
+		pr, pw := io.Pipe()
+		pwc <- pw
+
+		if func() {
+			err = copyWithBuffer(conn, pr)
+			conn.Close()
+		}(); err == nil {
+			log.Print("handlePipe2 done")
+			return
+		}
 	}
 }
-func handlePipe(r io.Reader, addr string) {
-	var conn net.Conn
-	done := make(chan bool)
-	stopdump := make(chan struct{})
-	ticker := time.NewTicker(5 * time.Second)
-	reconnect := make(chan bool)
 
-	defer func() {
-		close(stopdump)
-		ticker.Stop()
-	}()
-
-	go func() {
-		for {
-			if err := dumpReader(r, stopdump); err != nil {
-				if err := copyWithBuffer(conn, r); err != nil {
-					reconnect <- true
-				}
-			}
-			break
-		}
-	}()
-
-	go func() {
-		for {
-			if err := dumpReader(r, stopdump); err == nil {
-				break
-			}
-			if err := copyWithBuffer(conn, r); err != nil {
-				log.Print("handlePipe ", err)
-				conn.Close()
-				conn = nil
-			} else {
-				log.Print("handlePipe ")
-				conn.Close()
-				break
-			}
-		}
-		done <- true
-	}()
-
-L:
-	for {
-		select {
-		case <-done:
-			break L
-		case <-ticker.C:
-			if conn == nil {
-				c, err := dialTarget(addr)
-				if err == nil {
-					conn = c
-					stopdump <- struct{}{}
-				}
-			}
-		}
+// Dial to target and return conn
+// When error encountered, return nil conn
+func dialTarget(addr string) (conn net.Conn, err error) {
+	if conn, err = net.Dial("tcp", addr); err != nil {
+		log.Print(err)
+	} else {
+		log.Printf("dial %s: ok", addr)
 	}
-
-	log.Print("handlePipe done")
+	return
 }
 
 func copyWithBuffer(conn net.Conn, r io.Reader) (err error) {
@@ -196,107 +187,13 @@ func copyWithBuffer(conn net.Conn, r io.Reader) (err error) {
 	return
 }
 
-func handleConnection(conn net.Conn, w1, w2 *io.PipeWriter) {
-	log.Print("Handle connection")
-	defer conn.Close()
-	defer w1.CloseWithError(errors.New("done"))
-	defer w2.Close() // gracefully send EOF to the pipes
-
-	u := io.MultiWriter(w1, w2)
-
-	r := bufio.NewReader(conn)
-	for {
-		b, err := r.ReadBytes('\n')
-		if err != nil {
-			break
+func checkError(e error, msgs ...string) {
+	if e != nil {
+		if len(msgs) > 0 {
+			m := strings.Join(msgs, ", ")
+			log.Fatalf(m+": %v", e)
+		} else {
+			log.Fatal(e)
 		}
-		u.Write(b)
 	}
 }
-
-func writeFromPipeToRemote1(r io.Reader, c string) {
-	buf := make([]byte, 256)
-	for {
-		n, err := r.Read(buf)
-		if err != nil {
-			log.Print("byte ", err)
-			break
-		}
-		log.Printf("read from %s [%2d] %s", c, n, string(buf[:n]))
-	}
-}
-
-// Dial to target and return conn
-// When error encountered, return nil conn
-func dialTarget(addr string) (conn net.Conn, err error) {
-	if conn, err = net.Dial("tcp", addr); err != nil {
-		log.Print(err)
-	} else {
-		log.Printf("dial %s: ok", addr)
-	}
-	return
-}
-
-// log.Printf("dial %s: connected", addr)
-// func writeFromPipeToRemote(src io.Reader, addr string) {
-// 	buf := newQueueBuffer()
-
-// 	// Copy from buffer to dst
-// 	// Wait for buffer's close signal to quit
-// 	// io.Copy calls buf.Read() in for loop, until buf.Read() returns io.EOF error
-// 	// rBuffer returns io.EOF only when the buffer is closed, and no data to be copied
-// 	// rBuffer.Read() will read the remaining data, even if it is closed. But rBuffer.Write()
-// 	// will return ErrBufferBlocked error
-// 	go func() {
-// 		var conn net.Conn
-// 		defer func() {
-// 			if conn != nil {
-// 				conn.Close()
-// 			}
-// 		}()
-
-// 		for {
-// 			var err error
-// 			if conn, err = dialTarget(addr); err != nil {
-// 				log.Print(err)
-// 				time.Sleep(3 * time.Second)
-// 				continue
-// 			} else {
-// 				log.Printf("%s connected", addr)
-// 				buf.UnBlock()
-// 			}
-
-// 			// if err is nil, copy is done, quit
-// 			// if err is not nil, something wrong with conn, block buffer, retry connection
-// 			if _, err = io.Copy(conn, buf); err != nil {
-// 				if s, ok := err.(*net.OpError); ok {
-// 					log.Print("conn<-buffer: ", s)
-// 					break
-// 				} else {
-// 				}
-// 				buf.Block()
-// 				continue
-// 			} else {
-// 				break
-// 			}
-// 		}
-
-// 		log.Print("Write done")
-// 	}()
-
-// 	// inbound copy
-// 	for {
-// 		_, err := io.Copy(buf, src)
-// 		log.Print("inbound copy error: ", err)
-
-// 		if err == nil {
-// 			break
-// 		} else if err == ErrBufferBlocked {
-// 			continue
-// 		} else {
-// 			log.Fatal(err)
-// 		}
-// 	}
-// 	buf.Close()
-// 	log.Print("bye")
-// }
