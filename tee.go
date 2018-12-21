@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -59,125 +60,108 @@ func main() {
 		// both asynchronous io read/write operation, therefore are wrapped in goroutine
 		// they are interconnected with io.Pipe
 		go handleConnection(conn, *out1, *out2)
-		// pwc1 := make(chan *io.PipeWriter)
-		// pwc2 := make(chan *io.PipeWriter)
-		// go handlePipe1(*out1, pwc1)
-		// go handlePipe2(*out2, pwc2)
 	}
 }
 
-func handlePipe(conn net.Conn) *io.PipeWriter {
-	pr, pw := io.Pipe()
+func connectionGenerator(ctx context.Context, cc chan net.Conn, addr string) {
+	log.Print("---> newConnection ")
+	defer log.Print("newConnection --->")
 
-	go func() {
-		var err error
-		if func() {
-			err = copyWithBuffer(conn, pr)
-			pr.Close()
-			conn.Close()
-		}(); err == nil {
-			log.Print("handlePipe done")
-			return
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	// run loop until new connection generated and sent to channel
+	// loop is blocked if the generated connection is note consumed by channel cc
+	// loop ends when ctx.Done() receives cancel signal
+	for func() bool {
+		conn, err := dialTarget(addr)
+		if err == nil {
+			cc <- conn
 		}
-	}()
-
-	return pw
+		return err != nil
+		// if conn, err := dialTarget(addr); err == nil {
+		// 	cc <- conn
+		// 	return false
+		// }
+		// return true
+	}() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
-func handleConnection(conn net.Conn, addr1, addr2 string) {
-	var pw1, pw2 *io.PipeWriter
-	cancelall := make(chan struct{})
+func newOutboundPipe(ctx context.Context, addr string) (out *io.PipeWriter) {
+	log.Print("--> newOutboundPipe")
+	defer log.Print("newOutboundPipe -->")
+	cc := make(chan net.Conn)
+	pr, pw := io.Pipe()
+	out = pw
 
-	defer conn.Close()
+	go connectionGenerator(ctx, cc, addr)
 
 	go func() {
-		var c net.Conn
-		var err error
-		if c, err = dialTarget(addr2); err != nil {
-		L:
-			for {
-				ticker := time.NewTicker(5 * time.Second)
-				select {
-				case <-cancelall:
-					log.Print("ok1")
+		b := make([]byte, 32*1024)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case conn := <-cc:
+				// When copyWithBuffer returns error, it most probably due to bad connection,
+				// although it may also be corrupted buffer. In either case, retry the copy.
+				// When pipe is closed without error, copyWithBuffer returns no error.
+				// If copy returns no error, finish
+				// If copy returns error, go to next loop. The case conn := <-cc, tries to
+				// extract next available connection
+				if err := copyWithBuffer(conn, pr); err != nil {
+					conn.Close()
+					go connectionGenerator(ctx, cc, addr)
+				} else {
+					conn.Close()
 					return
-				case <-ticker.C:
-					log.Print("ok2")
-					if c, err = dialTarget(addr2); err == nil {
-						log.Print("ok3")
-						break L
-					}
+				}
+			default:
+				// if no connection is ready, consumes pipe into garbag
+				// if pipe is closed from writer side, quit
+				_, err := pr.Read(b)
+				if err != nil {
+					return
 				}
 			}
 		}
-
-		select {
-		case <-cancelall:
-			log.Print("ok4")
-		default:
-			log.Print("ok5")
-			pw2 = handlePipe(c)
-		}
 	}()
+
+	return
+}
+
+func handleConnection(conn net.Conn, addr1, addr2 string) {
+	log.Print("--> handleConnection")
+	defer log.Print("handleConnection -->")
+	defer conn.Close()
+
+	ctx, cancelPipes := context.WithCancel(context.Background())
+	pw2 := newOutboundPipe(ctx, *out2)
 
 	s := bufio.NewScanner(conn)
 	for s.Scan() {
 		b := s.Bytes()
 
-		if pw1 != nil {
-			if _, err := pw1.Write(b); err != nil {
-				pw1 = nil
-			}
-		}
+		// pipe is only closed from writer side, never from reader side
+		// so no error will be returned here
+		// no need to renew pipes here
 
-		if pw2 != nil {
-			if _, err := pw2.Write(b); err != nil {
-				pw2 = nil
-			}
-		}
+		// pw1.Write(b)
+		pw2.Write(b)
 	}
 
-	close(cancelall)
-
-	if pw1 != nil {
-		pw1.Close()
-	}
+	cancelPipes()
 
 	if pw2 != nil {
 		pw2.Close()
 	}
-
-	// r := bufio.NewReader(conn)
-	// for {
-	// 	// read from inbound connection.
-	// 	// break loop, when read returns error (including EOF).
-	// 	b, err := r.ReadBytes('\n')
-	// 	if err != nil {
-	// 		break
-	// 	}
-
-	// 	select {
-	// 	case pw1 = <-pwc1:
-	// 	default:
-	// 	}
-
-	// 	if pw1 != nil {
-	// 		if _, err := pw1.Write(b); err != nil {
-	// 			pw1 = nil
-	// 		}
-	// 	}
-
-	// 	select {
-	// 	case pw2 = <-pwc2:
-	// 	default:
-	// 	}
-
-	// 	if pw2 != nil {
-	// 		if _, err := pw2.Write(b); err != nil {
-	// 			pw2 = nil
-	// 		}
-	// 	}
-	// }
 }
 
 func handlePipe1(addr string, pwc chan *io.PipeWriter) {
