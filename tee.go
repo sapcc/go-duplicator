@@ -119,6 +119,7 @@ func handlePipe1(addr string, pwc chan *io.PipeWriter) {
 			log.Printf("hadlePipe1: read from %s [%2d] %s", addr, n, string(buf[:n]))
 		} else {
 			log.Print("hadlePipe1 done")
+			pw.Close()
 			return
 		}
 	}
@@ -139,6 +140,7 @@ func handlePipe2(addr string, pwc chan *io.PipeWriter) {
 
 		if func() {
 			err = copyWithBuffer(conn, pr)
+			pw.Close()
 			conn.Close()
 		}(); err == nil {
 			log.Print("handlePipe2 done")
