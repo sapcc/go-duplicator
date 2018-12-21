@@ -104,14 +104,16 @@ func (m *pipeBuffer) Read(p []byte) (int, error) {
 		select {
 		case <-m.done:
 			return 0, ErrBufferClosed
-		default:
-		}
-		select {
 		case <-m.stop:
 			log("buffer stopped")
+			// write is blocked, drain the buffer
+			m.mtx.Lock()
+			defer m.mtx.Unlock()
 			if m.buf[m.wr].Len() == 0 {
 				return 0, io.EOF
 			}
+			m.rd, m.wr = m.wr, m.rd
+			return 0, nil
 		case <-m.swap:
 			log("swap read/write")
 			// block read until write buffer is not empty
@@ -129,8 +131,7 @@ func (m *pipeBuffer) Read(p []byte) (int, error) {
 	default:
 		n, _ := m.buf[m.rd].Read(p)
 		time.Sleep(500 * time.Millisecond)
-		s, _ := fmt.Printf("%d bytes", n)
-		log(s)
+		log(fmt.Sprintf("%d bytes", n))
 		return n, nil
 	}
 }
