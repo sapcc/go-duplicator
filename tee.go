@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	listen = kingpin.Flag("listen", "Listen port.").Short('l').Default("2004").String()
+	listen = kingpin.Flag("listen", "Listen port.").Short('l').Default("2003").String()
 	out1   = kingpin.Flag("outport1", "Output port 1.").Short('1').Default("4001").String()
 	out2   = kingpin.Flag("outport2", "Output port 2.").Short('2').Default("4002").String()
 	debug  = kingpin.Flag("debug", "Debug.").Short('d').Default("false").Bool()
@@ -67,7 +67,7 @@ func main() {
 }
 
 func handleConnection(conn net.Conn, pwc1, pwc2 <-chan *io.PipeWriter) {
-	var w1, w2 interface{}
+	var pw1, pw2 *io.PipeWriter
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
@@ -80,30 +80,25 @@ func handleConnection(conn net.Conn, pwc1, pwc2 <-chan *io.PipeWriter) {
 		}
 
 		select {
-		case w1 = <-pwc1:
+		case pw1 = <-pwc1:
 		default:
 		}
 
-		if pw1, ok := w1.(*io.PipeWriter); ok {
-			defer pw1.Close()
+		if pw1 != nil {
 			if _, err := pw1.Write(b); err != nil {
-				w1 = nil
+				pw1 = nil
 			}
 		}
 
 		select {
-		case w2 = <-pwc2:
+		case pw2 = <-pwc2:
 		default:
 		}
 
-		if pw2, ok := w2.(*io.PipeWriter); ok {
-			log.Print("get pw2")
-			defer pw2.Close()
+		if pw2 != nil {
 			if _, err := pw2.Write(b); err != nil {
-				w2 = nil
+				pw2 = nil
 			}
-		} else {
-			log.Print("skip2")
 		}
 	}
 }
