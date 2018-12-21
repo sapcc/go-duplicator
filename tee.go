@@ -58,41 +58,76 @@ func main() {
 		// writeFromPipeToRemote() wirte data stream out to remote address
 		// both asynchronous io read/write operation, therefore are wrapped in goroutine
 		// they are interconnected with io.Pipe
-		pwc1 := make(chan *io.PipeWriter)
-		pwc2 := make(chan *io.PipeWriter)
-		go handleConnection(conn, pwc1, pwc2)
-		go handlePipe1(*out1, pwc1)
-		go handlePipe2(*out2, pwc2)
+		go handleConnection(conn, *out1, *out2)
+		// pwc1 := make(chan *io.PipeWriter)
+		// pwc2 := make(chan *io.PipeWriter)
+		// go handlePipe1(*out1, pwc1)
+		// go handlePipe2(*out2, pwc2)
 	}
 }
 
-func handleConnection(conn net.Conn, pwc1, pwc2 <-chan *io.PipeWriter) {
+func handlePipe(conn net.Conn) *io.PipeWriter {
+	pr, pw := io.Pipe()
+
+	go func() {
+		var err error
+		if func() {
+			err = copyWithBuffer(conn, pr)
+			pr.Close()
+			conn.Close()
+		}(); err == nil {
+			log.Print("handlePipe done")
+			return
+		}
+	}()
+
+	return pw
+}
+
+func handleConnection(conn net.Conn, addr1, addr2 string) {
 	var pw1, pw2 *io.PipeWriter
+	cancelall := make(chan struct{})
+
 	defer conn.Close()
 
-	r := bufio.NewReader(conn)
-	for {
-		// read from inbound connection.
-		// break loop, when read returns error (including EOF).
-		b, err := r.ReadBytes('\n')
-		if err != nil {
-			break
+	go func() {
+		var c net.Conn
+		var err error
+		if c, err = dialTarget(addr2); err != nil {
+		L:
+			for {
+				ticker := time.NewTicker(5 * time.Second)
+				select {
+				case <-cancelall:
+					log.Print("ok1")
+					return
+				case <-ticker.C:
+					log.Print("ok2")
+					if c, err = dialTarget(addr2); err == nil {
+						log.Print("ok3")
+						break L
+					}
+				}
+			}
 		}
 
 		select {
-		case pw1 = <-pwc1:
+		case <-cancelall:
+			log.Print("ok4")
 		default:
+			log.Print("ok5")
+			pw2 = handlePipe(c)
 		}
+	}()
+
+	s := bufio.NewScanner(conn)
+	for s.Scan() {
+		b := s.Bytes()
 
 		if pw1 != nil {
 			if _, err := pw1.Write(b); err != nil {
 				pw1 = nil
 			}
-		}
-
-		select {
-		case pw2 = <-pwc2:
-		default:
 		}
 
 		if pw2 != nil {
@@ -101,6 +136,48 @@ func handleConnection(conn net.Conn, pwc1, pwc2 <-chan *io.PipeWriter) {
 			}
 		}
 	}
+
+	close(cancelall)
+
+	if pw1 != nil {
+		pw1.Close()
+	}
+
+	if pw2 != nil {
+		pw2.Close()
+	}
+
+	// r := bufio.NewReader(conn)
+	// for {
+	// 	// read from inbound connection.
+	// 	// break loop, when read returns error (including EOF).
+	// 	b, err := r.ReadBytes('\n')
+	// 	if err != nil {
+	// 		break
+	// 	}
+
+	// 	select {
+	// 	case pw1 = <-pwc1:
+	// 	default:
+	// 	}
+
+	// 	if pw1 != nil {
+	// 		if _, err := pw1.Write(b); err != nil {
+	// 			pw1 = nil
+	// 		}
+	// 	}
+
+	// 	select {
+	// 	case pw2 = <-pwc2:
+	// 	default:
+	// 	}
+
+	// 	if pw2 != nil {
+	// 		if _, err := pw2.Write(b); err != nil {
+	// 			pw2 = nil
+	// 		}
+	// 	}
+	// }
 }
 
 func handlePipe1(addr string, pwc chan *io.PipeWriter) {
