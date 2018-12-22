@@ -20,13 +20,6 @@ var (
 	debug  = kingpin.Flag("debug", "Debug.").Short('d').Default("false").Bool()
 )
 
-// func checkEOF(e error, msgs ...string) bool {
-// 	if e == io.EOF {
-// 		return true
-// 	}
-// 	return checkError(e, msgs...)
-// }
-
 func main() {
 	kingpin.Parse()
 
@@ -63,27 +56,28 @@ func main() {
 	}
 }
 
-func connectionGenerator(ctx context.Context, cc chan net.Conn, addr string) {
+// Dial to addr. It keeps trying by a fix interval unitl
+// a connection is eastablished. It can be cancel by the ctx.Done().
+// To get a new connection, the function needs to be invoked again.
+func dialTarget(ctx context.Context, cc chan net.Conn, addr string) {
 	log.Print("---> newConnection ")
 	defer log.Print("newConnection --->")
 
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	// run loop until new connection generated and sent to channel
 	// loop is blocked if the generated connection is note consumed by channel cc
 	// loop ends when ctx.Done() receives cancel signal
 	for func() bool {
-		conn, err := dialTarget(addr)
-		if err == nil {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			log.Print(err)
+		} else {
+			log.Printf("dial %s: ok", addr)
 			cc <- conn
 		}
 		return err != nil
-		// if conn, err := dialTarget(addr); err == nil {
-		// 	cc <- conn
-		// 	return false
-		// }
-		// return true
 	}() {
 		select {
 		case <-ctx.Done():
@@ -100,7 +94,7 @@ func newOutboundPipe(ctx context.Context, addr string) (out *io.PipeWriter) {
 	pr, pw := io.Pipe()
 	out = pw
 
-	go connectionGenerator(ctx, cc, addr)
+	go dialTarget(ctx, cc, addr)
 
 	go func() {
 		b := make([]byte, 32*1024)
@@ -109,16 +103,21 @@ func newOutboundPipe(ctx context.Context, addr string) (out *io.PipeWriter) {
 			select {
 			case <-ctx.Done():
 				return
-			case conn := <-cc:
-				// When copyWithBuffer returns error, it most probably due to bad connection,
-				// although it may also be corrupted buffer. In either case, retry the copy.
-				// When pipe is closed without error, copyWithBuffer returns no error.
-				// If copy returns no error, finish
-				// If copy returns error, go to next loop. The case conn := <-cc, tries to
-				// extract next available connection
+			case conn := <-cc: // extract next available connection
+				log.Print("ok1")
+				// flush data in temporary buffer
+				if _, err := conn.Write(b); err != nil {
+					conn.Close()
+					go dialTarget(ctx, cc, addr)
+				}
+				// When inbound connection is closed, pipe writer is closed without
+				// error in handleConnection(). Subsequent read from Pipe will get
+				// EOF error, and copyWithBuffer() returns without error.
+				// CopyWithBuffer() may return error, because of bad outbound connection.
+				// It may also due to corrupted buffer. In both cases, retry the copy.
 				if err := copyWithBuffer(conn, pr); err != nil {
 					conn.Close()
-					go connectionGenerator(ctx, cc, addr)
+					go dialTarget(ctx, cc, addr)
 				} else {
 					conn.Close()
 					return
@@ -126,7 +125,9 @@ func newOutboundPipe(ctx context.Context, addr string) (out *io.PipeWriter) {
 			default:
 				// if no connection is ready, consumes pipe into garbag
 				// if pipe is closed from writer side, quit
+				log.Print("ok2")
 				_, err := pr.Read(b)
+				log.Print(len(b), string(b))
 				if err != nil {
 					return
 				}
@@ -144,17 +145,17 @@ func handleConnection(conn net.Conn, addr1, addr2 string) {
 
 	ctx, cancelPipes := context.WithCancel(context.Background())
 	pw2 := newOutboundPipe(ctx, *out2)
+	pw1 := newOutboundPipe(ctx, *out1)
 
 	s := bufio.NewScanner(conn)
 	for s.Scan() {
 		b := s.Bytes()
 
-		// pipe is only closed from writer side, never from reader side
-		// so no error will be returned here
-		// no need to renew pipes here
-
-		// pw1.Write(b)
-		pw2.Write(b)
+		// pipe is never closed from reader side
+		// therefor no return error from writing to pipe.
+		// Pipe is closed only when inbound connection is closed
+		pw1.Write(append(b, '\n'))
+		pw2.Write(append(b, '\n'))
 	}
 
 	cancelPipes()
@@ -164,83 +165,57 @@ func handleConnection(conn net.Conn, addr1, addr2 string) {
 	}
 }
 
-func handlePipe1(addr string, pwc chan *io.PipeWriter) {
-	log.Print("handlePipe1")
-	buf := make([]byte, 32*1024)
+// func handlePipe1(addr string, pwc chan *io.PipeWriter) {
+func newOutboundPipe1(ctx context.Context, addr string) (out *io.PipeWriter) {
+	log.Print("--> newOutboundPipe1")
+	defer log.Print("newOutboundPipe1 -->")
 	pr, pw := io.Pipe()
-	pwc <- pw
+	out = pw
 
-	for {
-		if n, err := pr.Read(buf); err == nil {
-			log.Printf("hadlePipe1: read from %s [%2d] %s", addr, n, string(buf[:n]))
-		} else {
-			log.Print("hadlePipe1 done")
-			pw.Close()
-			return
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if n, err := pr.Read(buf); err == nil {
+				log.Printf("Pipe1: read from %s [%2d] %s", addr, n, string(buf[:n]))
+			} else {
+				log.Print("Pipe1 done")
+				pw.Close()
+				return
+			}
 		}
-	}
-}
-
-func handlePipe2(addr string, pwc chan *io.PipeWriter) {
-	log.Print("handlePipe2")
-
-	for {
-		conn, err := dialTarget(addr)
-		if err != nil {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		pr, pw := io.Pipe()
-		pwc <- pw
-
-		if func() {
-			err = copyWithBuffer(conn, pr)
-			pw.Close()
-			conn.Close()
-		}(); err == nil {
-			log.Print("handlePipe2 done")
-			return
-		}
-	}
-}
-
-// Dial to target and return conn
-// When error encountered, return nil conn
-func dialTarget(addr string) (conn net.Conn, err error) {
-	if conn, err = net.Dial("tcp", addr); err != nil {
-		log.Print(err)
-	} else {
-		log.Printf("dial %s: ok", addr)
-	}
-	return
+	}()
+	return pw
 }
 
 func copyWithBuffer(conn net.Conn, r io.Reader) (err error) {
-	log := func(c interface{}) { log.Printf("copyWithBuffer: %s", c) }
+	log.Print("--> copyWithBuffer")
+	defer log.Print("copyWithBuffer -->")
 	buf := newPipeBuffer()
 
-	log("...")
 	if conn == nil {
-		log("no connection")
-		return errors.New("no connection")
+		return errors.New("nil connection")
 	}
 
 	// inbound copy
 	go func() {
+		log.Print("copyWithBuffer > inbound copy")
+		defer log.Print("copyWithBuffer > inbound copy -->")
 		if _, err := io.Copy(buf, r); err == nil {
-			log(err)
+			log.Print("copyWithBuffer > inbound copy > buf.Stop")
 			buf.Stop()
 		} else {
-			log(err)
+			log.Print("copyWithBuffer > inbound copy > buf.Close")
 			buf.Close()
 		}
 	}()
 
 	// outbound copy
 	_, err = io.Copy(conn, buf)
-	log(err)
-	log("///")
 
 	return
 }
