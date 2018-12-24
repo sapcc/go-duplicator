@@ -72,12 +72,15 @@ func dialTarget(ctx context.Context, cc chan net.Conn, addr string) {
 	for func() bool {
 		conn, err := net.Dial("tcp", addr)
 		if err != nil {
+			// redail addr when ticker.C ticks next time
 			log.Print(err)
-		} else {
-			log.Printf("dial %s: ok", addr)
-			cc <- conn
+			return true
 		}
-		return err != nil
+		// send connection via channel
+		log.Printf("dial %s: ok", addr)
+		cc <- conn
+		log.Print("connection sent.")
+		return false
 	}() {
 		select {
 		case <-ctx.Done():
@@ -87,12 +90,13 @@ func dialTarget(ctx context.Context, cc chan net.Conn, addr string) {
 	}
 }
 
-func newOutboundPipe(ctx context.Context, addr string) (out *io.PipeWriter) {
+func newOutboundPipe(addr string) (pw *io.PipeWriter) {
 	log.Print("--> newOutboundPipe")
 	defer log.Print("newOutboundPipe -->")
-	cc := make(chan net.Conn)
+
 	pr, pw := io.Pipe()
-	out = pw
+	cc := make(chan net.Conn)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	go dialTarget(ctx, cc, addr)
 
@@ -100,38 +104,53 @@ func newOutboundPipe(ctx context.Context, addr string) (out *io.PipeWriter) {
 		b := make([]byte, 32*1024)
 
 		for {
+			log.Print("--> copy")
 			select {
-			case <-ctx.Done():
-				return
+			// case <-ctx.Done():
+			// 	return
 			case conn := <-cc: // extract next available connection
+				defer conn.Close()
+				defer pr.Close()
 				log.Print("ok1")
-				// flush data in temporary buffer
-				if _, err := conn.Write(b); err != nil {
-					conn.Close()
-					go dialTarget(ctx, cc, addr)
+				if _, err := conn.Write(b); err == nil {
+					log.Print("ok2")
+					copyWithBuffer(conn, pr)
 				}
+				return
+				// flush data in temporary buffer
+				// if _, err := conn.Write(b); err != nil {
+				// 	conn.Close()
+				// 	go dialTarget(ctx, cc, addr)
+				// }
 				// When inbound connection is closed, pipe writer is closed without
 				// error in handleConnection(). Subsequent read from Pipe will get
 				// EOF error, and copyWithBuffer() returns without error.
 				// CopyWithBuffer() may return error, because of bad outbound connection.
 				// It may also due to corrupted buffer. In both cases, retry the copy.
-				if err := copyWithBuffer(conn, pr); err != nil {
-					conn.Close()
-					go dialTarget(ctx, cc, addr)
-				} else {
-					conn.Close()
-					return
-				}
+				// if err := copyWithBuffer(conn, pr); err != nil {
+				// 	log.Print("ok2")
+				// 	pr.Close()
+				// 	conn.Close()
+				// } else {
+				// 	pr.Close()
+				// 	conn.Close()
+				// 	return
+				// }
 			default:
-				// if no connection is ready, consumes pipe into garbag
-				// if pipe is closed from writer side, quit
-				log.Print("ok2")
-				_, err := pr.Read(b)
-				log.Print(len(b), string(b))
-				if err != nil {
+				// When no connection is ready, consumes pipe with temperary buffer b
+				// When pipe is closed from writer side, cancel dialing connection and return
+				log.Print("ok3")
+				if _, err := pr.Read(b); err != nil {
+					select {
+					case conn := <-cc:
+						conn.Close()
+					default:
+						cancel()
+					}
 					return
 				}
 			}
+			log.Print("copy -->")
 		}
 	}()
 
@@ -143,22 +162,24 @@ func handleConnection(conn net.Conn, addr1, addr2 string) {
 	defer log.Print("handleConnection -->")
 	defer conn.Close()
 
-	ctx, cancelPipes := context.WithCancel(context.Background())
-	pw2 := newOutboundPipe(ctx, *out2)
-	pw1 := newOutboundPipe(ctx, *out1)
+	// pw1 := newOutboundPipe(ctx, *out1)
+	pw2 := newOutboundPipe(*out2)
 
 	s := bufio.NewScanner(conn)
 	for s.Scan() {
 		b := s.Bytes()
+		b = append(b, '\n')
 
-		// pipe is never closed from reader side
 		// therefor no return error from writing to pipe.
 		// Pipe is closed only when inbound connection is closed
-		pw1.Write(append(b, '\n'))
-		pw2.Write(append(b, '\n'))
+		// pw1.Write(append(b, '\n'))
+		// when pipe is closed from reader side, create a new pipe
+		if _, err := pw2.Write(b); err != nil {
+			log.Print(err)
+			pw2 = newOutboundPipe(*out2)
+			pw2.Write(b)
+		}
 	}
-
-	cancelPipes()
 
 	if pw2 != nil {
 		pw2.Close()
@@ -201,21 +222,35 @@ func copyWithBuffer(conn net.Conn, r io.Reader) (err error) {
 		return errors.New("nil connection")
 	}
 
-	// inbound copy
+	// inbound
 	go func() {
-		log.Print("copyWithBuffer > inbound copy")
-		defer log.Print("copyWithBuffer > inbound copy -->")
-		if _, err := io.Copy(buf, r); err == nil {
-			log.Print("copyWithBuffer > inbound copy > buf.Stop")
-			buf.Stop()
-		} else {
-			log.Print("copyWithBuffer > inbound copy > buf.Close")
-			buf.Close()
-		}
+		log.Print("--> copyWithBuffer > inbound copy")
+		io.Copy(buf, r)
+		buf.Close()
+		log.Print("copyWithBuffer > inbound copy -->")
 	}()
 
-	// outbound copy
-	_, err = io.Copy(conn, buf)
+	// outbound
+	if _, err = io.Copy(conn, buf); err != nil {
+		log.Print(err)
+		buf.Stop()
+	}
+
+	// inbound copy
+	// go func() {
+	// 	log.Print("copyWithBuffer > inbound copy")
+	// 	defer log.Print("copyWithBuffer > inbound copy -->")
+	// 	if _, err := io.Copy(buf, r); err == nil {
+	// 		log.Print("copyWithBuffer > inbound copy > buf.Stop")
+	// 		buf.Stop()
+	// 	} else {
+	// 		log.Print("copyWithBuffer > inbound copy > buf.Close")
+	// 		buf.Close()
+	// 	}
+	// }()
+
+	// // outbound copy
+	// _, err = io.Copy(conn, buf)
 
 	return
 }
