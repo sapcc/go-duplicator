@@ -96,63 +96,102 @@ func newOutboundPipe(addr string) (pw *io.PipeWriter) {
 
 	pr, pw := io.Pipe()
 	cc := make(chan net.Conn)
+	var bcw *bcWriter
 	ctx, cancel := context.WithCancel(context.Background())
+
+	readPipe := func(pr *io.PipeReader, b []byte) (n int, ok bool) {
+		var err error
+		if n, err = pr.Read(b); err == nil {
+			select {
+			case conn := <-cc:
+				bcw = &bcWriter{newPipeBuffer(), conn}
+				go bcw.Flush()
+			default:
+			}
+			ok = true
+		} else {
+			select {
+			case conn := <-cc:
+				conn.Close()
+			default:
+				cancel()
+			}
+		}
+		return
+	}
 
 	go dialTarget(ctx, cc, addr)
 
 	go func() {
 		b := make([]byte, 32*1024)
-
-		for {
-			log.Print("--> copy")
-			select {
-			// case <-ctx.Done():
-			// 	return
-			case conn := <-cc: // extract next available connection
-				defer conn.Close()
-				defer pr.Close()
-				log.Print("ok1")
-				if _, err := conn.Write(b); err == nil {
-					log.Print("ok2")
-					copyWithBuffer(conn, pr)
-				}
-				return
-				// flush data in temporary buffer
-				// if _, err := conn.Write(b); err != nil {
-				// 	conn.Close()
-				// 	go dialTarget(ctx, cc, addr)
-				// }
-				// When inbound connection is closed, pipe writer is closed without
-				// error in handleConnection(). Subsequent read from Pipe will get
-				// EOF error, and copyWithBuffer() returns without error.
-				// CopyWithBuffer() may return error, because of bad outbound connection.
-				// It may also due to corrupted buffer. In both cases, retry the copy.
-				// if err := copyWithBuffer(conn, pr); err != nil {
-				// 	log.Print("ok2")
-				// 	pr.Close()
-				// 	conn.Close()
-				// } else {
-				// 	pr.Close()
-				// 	conn.Close()
-				// 	return
-				// }
-			default:
-				// When no connection is ready, consumes pipe with temperary buffer b
-				// When pipe is closed from writer side, cancel dialing connection and return
-				log.Print("ok3")
-				if _, err := pr.Read(b); err != nil {
-					select {
-					case conn := <-cc:
-						conn.Close()
-					default:
-						cancel()
-					}
+		for n, ok := readPipe(pr, b); ok; n, ok = readPipe(pr, b) {
+			log.Print("ok1")
+			if bcw != nil {
+				log.Print("ok2")
+				if _, err := bcw.Write(b[:n]); err != nil {
+					log.Print("ok3")
+					pr.Close()
+					bcw.conn.Close()
 					return
 				}
 			}
-			log.Print("copy -->")
 		}
+		bcw.conn.Close()
 	}()
+
+	// go func() {
+	// 	b := make([]byte, 32*1024)
+
+	// 	for {
+	// 		log.Print("--> copy")
+	// 		select {
+	// 		// case <-ctx.Done():
+	// 		// 	return
+	// 		case conn := <-cc: // extract next available connection
+	// 			defer conn.Close()
+	// 			defer pr.Close()
+	// 			log.Print("ok1")
+	// 			if _, err := conn.Write(b); err == nil {
+	// 				log.Print("ok2")
+	// 				copyWithBuffer(conn, pr)
+	// 			}
+	// 			return
+	// 			// flush data in temporary buffer
+	// 			// if _, err := conn.Write(b); err != nil {
+	// 			// 	conn.Close()
+	// 			// 	go dialTarget(ctx, cc, addr)
+	// 			// }
+	// 			// When inbound connection is closed, pipe writer is closed without
+	// 			// error in handleConnection(). Subsequent read from Pipe will get
+	// 			// EOF error, and copyWithBuffer() returns without error.
+	// 			// CopyWithBuffer() may return error, because of bad outbound connection.
+	// 			// It may also due to corrupted buffer. In both cases, retry the copy.
+	// 			// if err := copyWithBuffer(conn, pr); err != nil {
+	// 			// 	log.Print("ok2")
+	// 			// 	pr.Close()
+	// 			// 	conn.Close()
+	// 			// } else {
+	// 			// 	pr.Close()
+	// 			// 	conn.Close()
+	// 			// 	return
+	// 			// }
+	// 		default:
+	// 			// When no connection is ready, consumes pipe with temperary buffer b
+	// 			// When pipe is closed from writer side, cancel dialing connection and return
+	// 			log.Print("ok3")
+	// 			if _, err := pr.Read(b); err != nil {
+	// 				select {
+	// 				case conn := <-cc:
+	// 					conn.Close()
+	// 				default:
+	// 					cancel()
+	// 				}
+	// 				return
+	// 			}
+	// 		}
+	// 		log.Print("copy -->")
+	// 	}
+	// }()
 
 	return
 }
@@ -183,6 +222,23 @@ func handleConnection(conn net.Conn, addr1, addr2 string) {
 
 	if pw2 != nil {
 		pw2.Close()
+	}
+}
+
+type bcWriter struct { // buffered connection writer
+	buf  *pipeBuffer
+	conn net.Conn
+}
+
+func (w *bcWriter) Write(p []byte) (n int, e error) {
+	n, e = w.buf.Write(p)
+	return
+}
+
+func (w *bcWriter) Flush() {
+	if _, err := io.Copy(w.conn, w.buf); err != nil {
+		log.Print(err)
+		w.buf.Stop()
 	}
 }
 
