@@ -5,18 +5,19 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"time"
 )
 
 type pipeBuffer struct {
-	blocked bool
-	rd, wr  int8
-	buf     []bytes.Buffer
-	swap    chan struct{}
-	done    chan struct{}
-	stop    chan struct{}
-	mtx     *sync.Mutex
+	rd, wr     int8
+	buf        []bytes.Buffer
+	swap       chan struct{}
+	done       chan struct{}
+	stop       chan struct{}
+	mtx        *sync.Mutex
+	closeError error
 }
 
 func newPipeBuffer() *pipeBuffer {
@@ -37,8 +38,8 @@ var ErrBufferStopped = errors.New("buffer is stopped")
 // ErrBufferClosed means neither write nor read is allowed
 var ErrBufferClosed = errors.New("buffer is closed")
 
-// close buffer
-func (m *pipeBuffer) Close() {
+// close both read and write to buffer
+func (m *pipeBuffer) Close(err error) {
 	select {
 	case <-m.done:
 		return
@@ -46,12 +47,13 @@ func (m *pipeBuffer) Close() {
 	}
 	m.buf[0].Reset()
 	m.buf[1].Reset()
+	m.closeError = err
 	close(m.done)
 }
 
 // Stop buffer
 // After buffer is stopped,  Write() is not allowed, while Read() is ok
-func (m *pipeBuffer) Stop() {
+func (m *pipeBuffer) CloseWrite() {
 	select {
 	case <-m.stop:
 		return
@@ -66,6 +68,9 @@ func (m *pipeBuffer) Stop() {
 func (m *pipeBuffer) Write(p []byte) (int, error) {
 	select {
 	case <-m.done:
+		if m.closeError != nil {
+			return 0, m.closeError
+		}
 		return 0, ErrBufferClosed
 	default:
 	}
@@ -83,10 +88,6 @@ func (m *pipeBuffer) Write(p []byte) (int, error) {
 	}
 
 	return m.buf[m.wr].Write(p)
-}
-
-func (m *pipeBuffer) empty() bool {
-	return m.buf[m.rd].Len() == 0 && m.buf[m.wr].Len() == 0
 }
 
 func (m *pipeBuffer) Read(p []byte) (int, error) {
@@ -123,4 +124,10 @@ func (m *pipeBuffer) Read(p []byte) (int, error) {
 		log.Printf("%d bytes read", n)
 		return n, nil
 	}
+}
+
+func (m *pipeBuffer) FlushTo(conn net.Conn) {
+	_, err := io.Copy(conn, m)
+	m.Close(err)
+	conn.Close()
 }
