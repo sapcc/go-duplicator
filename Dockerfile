@@ -9,7 +9,7 @@ FROM alpine:3.5
 #     && mv /go/bin/gotee /usr/local/bin \
 #     && apk del go musl-dev git mercurial
 
-COPY gotee /usr/local/bin/gotee
+COPY go-duplicator /usr/local/bin/gotee
 
 ENTRYPOINT [ "gotee" ]
 CMD [ "--listen", "2003", "-1", "4001", "-2", "4002" ]
