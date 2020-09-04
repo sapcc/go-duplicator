@@ -1,4 +1,5 @@
 FROM alpine:3.5
+LABEL source_repository="https://github.com/sapcc/go-duplicator"
 
 # WORKDIR /go/src/gotee
 # COPY client.go tee.go ./
